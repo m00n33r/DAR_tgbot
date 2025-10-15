@@ -296,7 +296,7 @@ class DatabaseManager:
     def get_booking_by_id(self, booking_id: int) -> Optional[Dict]:
         """Получить бронирование по ID"""
         query = '''
-            SELECT b.*, r.name as room_name, r.room_number, u.full_name as user_full_name
+            SELECT b.*, r.name as room_name, r.room_number, u.first_name, u.last_name
             FROM bookings b
             JOIN rooms r ON b.room_id = r.id
             JOIN users u ON b.user_id = u.id
@@ -326,7 +326,7 @@ class DatabaseManager:
         end_of_day = datetime.combine(booking_date, time.max).isoformat()
         
         query = '''
-            SELECT b.*, u.full_name as user_full_name
+            SELECT b.*, u.first_name, u.last_name
             FROM bookings b
             JOIN users u ON b.user_id = u.id
             WHERE b.room_id = ? AND b.start_time >= ? AND b.start_time <= ? AND b.status = 'confirmed'
@@ -352,7 +352,7 @@ class DatabaseManager:
     def get_all_bookings(self) -> List[Dict]:
         """Получить все бронирования (для админов)"""
         query = '''
-            SELECT b.*, r.name as room_name, r.room_number, u.full_name as user_full_name
+            SELECT b.*, r.name as room_name, r.room_number, u.first_name, u.last_name
             FROM bookings b
             JOIN rooms r ON b.room_id = r.id
             JOIN users u ON b.user_id = u.id
@@ -427,3 +427,13 @@ class DatabaseManager:
         except sqlite3.Error as e:
             print(f"Database error: {e}")
             return False
+
+    def get_floors(self):
+        """Получает список всех этажей."""
+        try:
+            query = "SELECT DISTINCT floor FROM rooms ORDER BY floor"
+            result = self._execute_query(query, fetch_all=True)
+            return [row['floor'] for row in result] if result else []
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+            return []

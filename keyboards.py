@@ -69,7 +69,6 @@ class Keyboards:
         """Возвращает клавиатуру для админ-панели."""
         keyboard = [
             [InlineKeyboardButton("✏️ Редактировать аудитории", callback_data='admin_edit_rooms')],
-            [InlineKeyboardButton("➕ Добавить аудиторию", callback_data='admin_add_room')],
             [InlineKeyboardButton("👥 Контакты пользователей", callback_data='admin_user_contacts')],
             [InlineKeyboardButton("📅 Удалить бронирование", callback_data='admin_booking_delete_menu')],
             [InlineKeyboardButton("🚪 Выйти из админ-панели", callback_data='exit_admin')]

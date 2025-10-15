@@ -130,8 +130,19 @@ def main():
     application.add_handler(MessageHandler(filters.Regex('^📋 Активные брони$'), handlers.show_all_active_bookings_calendar))
     application.add_handler(MessageHandler(filters.Regex('^ℹ️ Помощь$'), handlers.show_help))
     
-    # ConversationHandler админ-панели теперь основной способ входа
-    application.add_handler(admin_conv_handler)
+    # Админ-панель через обычные обработчики (без ConversationHandler)
+    application.add_handler(MessageHandler(filters.Regex('^🛠 Админ-панель$'), handlers.show_admin_panel))
+    # Единый обработчик текстов для пароля и редактирования
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text_global))
+    # Колбэки админки
+    application.add_handler(CallbackQueryHandler(handlers.admin_add_room_start, pattern='^admin_add_room$'))
+    application.add_handler(CallbackQueryHandler(handlers.admin_contacts_start, pattern='^admin_user_contacts$'))
+    application.add_handler(CallbackQueryHandler(handlers.admin_delete_booking_start, pattern='^admin_booking_delete_menu$'))
+    application.add_handler(CallbackQueryHandler(handlers.admin_edit_room_start, pattern='^admin_edit_rooms$'))
+    application.add_handler(CallbackQueryHandler(handlers.admin_edit_select_floor, pattern='^admin_edit_floor_'))
+    application.add_handler(CallbackQueryHandler(handlers.admin_edit_select_room, pattern='^admin_edit_room_'))
+    application.add_handler(CallbackQueryHandler(handlers.admin_edit_select_field, pattern='^admin_edit_field_'))
+    application.add_handler(CallbackQueryHandler(handlers.admin_confirm_delete_booking, pattern='^admin_confirm_delete_'))
     
     # Важно: этот обработчик должен идти после ConversationHandler, чтобы не перехватывать его callback'и
     application.add_handler(CallbackQueryHandler(handlers.handle_other_callbacks))
