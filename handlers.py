@@ -37,8 +37,8 @@ class Handlers:
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        if not self.db.get_user_by_telegram_id(user.id):
-            self.db.create_user(user.id, user.username, user.first_name)
+        # Ensure the user exists in DB using the unified user management API
+        self.db.get_or_create_user(user)
         await update.message.reply_text(
             f"🎉 Добро пожаловать, {user.first_name}!\nВыберите раздел в меню:",
             reply_markup=Keyboards.get_main_menu()
@@ -343,10 +343,20 @@ class Handlers:
             text = f"📋 Бронирования на {selected_date.strftime('%d.%m.%Y')}:\n\n"
             for b in bookings_raw:
                 room = self.db.get_room_by_id(b['room_id'])
+                user = self.db.get_user_by_id(b['user_id'])
                 start_time_dt = datetime.fromisoformat(b['start_time'])
                 end_time_dt = datetime.fromisoformat(b['end_time'])
+                
+                # Формируем имя пользователя
+                if user:
+                    first_name = user.get('first_name', '')
+                    last_name = user.get('last_name', '')
+                    user_full_name = f"{first_name} {last_name}".strip() or "Неизвестный"
+                else:
+                    user_full_name = b.get('full_name', 'Неизвестный')
+                
                 text += f"🏢 **{room.get('name', '?')}** ({start_time_dt.strftime('%H:%M')}-{end_time_dt.strftime('%H:%M')})\n"
-                text += f"👤 {b['full_name']}\n🎯 {b['purpose']}\n\n"
+                text += f"👤 {user_full_name}\n🎯 {b['purpose']}\n\n"
         await query.edit_message_text(text, reply_markup=Keyboards.get_back_to_calendar_keyboard(), parse_mode='Markdown')
 
     async def show_floor_rooms(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -573,7 +583,12 @@ class Handlers:
                 room = self.db.get_room_by_id(b['room_id'])
                 
                 username = f"@{user['username']}" if user and user.get('username') else "скрыт"
-                user_full_name = user.get('first_name', "Неизвестный") if user else "Неизвестный"
+                if user:
+                    first_name = user.get('first_name', '')
+                    last_name = user.get('last_name', '')
+                    user_full_name = f"{first_name} {last_name}".strip() or "Неизвестный"
+                else:
+                    user_full_name = "Неизвестный"
                 room_name = room.get('name', 'Неизвестная аудитория') if room else 'Неизвестная аудитория'
                 
                 start_time_dt = datetime.fromisoformat(b['start_time'])
