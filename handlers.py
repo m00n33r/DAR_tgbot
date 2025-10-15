@@ -1,413 +1,445 @@
-from telegram import Update, InlineKeyboardMarkup
-from telegram.ext import ContextTypes, ConversationHandler
-from datetime import datetime, date, time
-import re
-from database import DatabaseManager
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import ConversationHandler, ContextTypes
+from datetime import datetime, date
+from database_sqlite import DatabaseManager
 from keyboards import Keyboards
+from calendar_widget import booking_calendar
+import locale
+from itertools import groupby
+import logging
 
-# Состояния для ConversationHandler
-CHOOSING_FLOOR, CHOOSING_ROOM, ENTERING_ROOM_NUMBER, ENTERING_FULL_NAME, ENTERING_PURPOSE, ENTERING_DATE, ENTERING_START_TIME, ENTERING_END_TIME, ADMIN_PASSWORD = range(9)
+# Устанавливаем русскую локаль для форматирования даты
+try:
+    locale.setlocale(locale.LC_TIME, 'ru_RU.UTF-8')
+except locale.Error:
+    locale.setlocale(locale.LC_TIME, 'Russian_Russia.1251')
+
+
+(
+    CHOOSING_FLOOR, CHOOSING_ROOM, ENTERING_FULL_NAME, ENTERING_PURPOSE,
+    SELECTING_DATE, ENTERING_START_TIME, ENTERING_END_TIME,
+    CONFIRMING_BOOKING, ADMIN_PASSWORD, ENTERING_MANUAL_DATE
+) = range(10)
+
+# Состояния для админ-панели
+(
+    ADMIN_MAIN, ADMIN_ADDING_ROOM_FLOOR, ADMIN_ADDING_ROOM_NUMBER,
+    ADMIN_ADDING_ROOM_NAME, ADMIN_ADDING_ROOM_CAPACITY, ADMIN_ADDING_ROOM_EQUIPMENT,
+    ADMIN_ADDING_ROOM_DESCRIPTION, ADMIN_SELECT_CONTACTS_DATE, ADMIN_SELECT_DELETE_DATE,
+    ADMIN_EDIT_SELECT_FLOOR, ADMIN_EDIT_SELECT_ROOM, ADMIN_EDIT_SELECT_FIELD,
+    ADMIN_EDIT_SET_NEW_VALUE
+) = range(10, 23)
+
 
 class Handlers:
     def __init__(self):
         self.db = DatabaseManager()
-        self.user_states = {}  # Хранение состояния пользователей
-    
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /start"""
         user = update.effective_user
-        telegram_id = user.id
-        
-        # Проверяем, существует ли пользователь в базе
-        db_user = self.db.get_user_by_telegram_id(telegram_id)
-        if not db_user:
-            # Создаем нового пользователя
-            self.db.create_user(telegram_id, user.username, user.first_name)
-        
-        welcome_text = f"""
-🎉 Добро пожаловать в бот бронирования аудиторий КЦ «Дар»!
-
-👋 Привет, {user.first_name}!
-
-Выберите нужный раздел в главном меню:
-🗂 Аудитории - информация о доступных аудиториях
-📅 Забронировать - забронировать аудиторию
-🔎 Мои брони - ваши активные брони
-🛠 Админ-панель - управление системой (только для администраторов)
-ℹ️ Помощь - справка по использованию бота
-        """
-        
+        if not self.db.get_user_by_telegram_id(user.id):
+            self.db.create_user(user.id, user.username, user.first_name)
         await update.message.reply_text(
-            welcome_text,
+            f"🎉 Добро пожаловать, {user.first_name}!\nВыберите раздел в меню:",
             reply_markup=Keyboards.get_main_menu()
         )
-    
+
     async def show_rooms(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать выбор этажа для просмотра аудиторий"""
         await update.message.reply_text(
             "🏢 Выберите этаж для просмотра аудиторий:",
             reply_markup=Keyboards.get_floors_keyboard()
         )
-    
-    async def show_floor_rooms(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать аудитории на выбранном этаже"""
+
+    async def start_booking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        for key in list(context.user_data.keys()):
+            if key.startswith('booking_'):
+                del context.user_data[key]
+        await update.message.reply_text(
+            "🏢 Выберите этаж для бронирования:",
+            reply_markup=Keyboards.get_booking_floors_keyboard()
+        )
+        return CHOOSING_FLOOR
+
+    async def show_floor_rooms_for_booking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
-        
-        floor = int(query.data.split('_')[1])
+        floor = int(query.data.split("_")[2])
+        context.user_data['booking_floor'] = floor
         rooms = self.db.get_rooms_by_floor(floor)
-        
         if not rooms:
             await query.edit_message_text(
                 f"❌ На {floor} этаже нет доступных аудиторий.",
-                reply_markup=Keyboards.get_floors_keyboard()
+                reply_markup=Keyboards.get_booking_floors_keyboard()
             )
-            return
-        
-        # Сохраняем выбранный этаж в контексте
-        context.user_data['selected_floor'] = floor
-        context.user_data['rooms'] = rooms
-        
+            return CHOOSING_FLOOR
         await query.edit_message_text(
-            f"🏢 Аудитории на {floor} этаже:",
-            reply_markup=Keyboards.get_rooms_keyboard(rooms, floor)
+            f"🏢 Выберите аудиторию на {floor} этаже:",
+            reply_markup=Keyboards.get_booking_rooms_keyboard(rooms, floor)
         )
-    
-    async def show_room_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать детальную информацию об аудитории"""
+        return CHOOSING_ROOM
+
+    async def start_booking_from_room_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
+        room_id = int(query.data.split("_")[3])
+        room = self.db.get_room_by_id(room_id)
+        if not room:
+            await query.edit_message_text("❌ Аудитория не найдена.")
+            return ConversationHandler.END
+        for key in list(context.user_data.keys()):
+            if key.startswith('booking_'):
+                del context.user_data[key]
+        context.user_data['booking_room_id'] = room_id
+        context.user_data['booking_room'] = room
+        room_name = room.get('name', f'Аудитория {room["room_number"]}')
+        await query.edit_message_text(
+            f"🏢 Выбрана аудитория: {room_name}\n\n👤 Введите ваше ФИО:",
+            reply_markup=Keyboards.get_cancel_keyboard()
+        )
+        return ENTERING_FULL_NAME
+
+    async def start_booking_from_room(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        room_id = int(query.data.split("_")[2])
+        room = self.db.get_room_by_id(room_id)
+        if not room:
+            await query.edit_message_text("❌ Аудитория не найдена.")
+            return CHOOSING_ROOM
+        context.user_data['booking_room_id'] = room_id
+        context.user_data['booking_room'] = room
+        room_name = room.get('name', f'Аудитория {room["room_number"]}')
+        await query.edit_message_text(
+            f"🏢 Выбрана аудитория: {room_name}\n\n👤 Введите ваше ФИО:",
+            reply_markup=Keyboards.get_cancel_keyboard()
+        )
+        return ENTERING_FULL_NAME
+
+    async def enter_full_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data['booking_full_name'] = update.message.text.strip()
+        await update.message.reply_text("🎯 Введите цель мероприятия:", reply_markup=Keyboards.get_cancel_keyboard())
+        return ENTERING_PURPOSE
+
+    async def enter_purpose(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data['booking_purpose'] = update.message.text.strip()
+        now = datetime.now()
+        calendar_markup = booking_calendar.create_calendar(year=now.year, month=now.month)
+        context.user_data['calendar_context'] = 'booking_date'
+        await update.message.reply_text("📅 Выберите дату мероприятия:", reply_markup=calendar_markup)
+        return SELECTING_DATE
+
+    async def request_manual_date(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text("📅 Введите дату бронирования в формате ДД.ММ.ГГГГ:")
+        return ENTERING_MANUAL_DATE
+
+    async def handle_manual_date_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        date_text = update.message.text.strip()
+        try:
+            booking_date = datetime.strptime(date_text, '%d.%m.%Y').date()
+            if booking_date < date.today():
+                await update.message.reply_text("❌ Нельзя бронировать на прошедшую дату. Введите дату еще раз:")
+                return ENTERING_MANUAL_DATE
+            context.user_data['booking_date'] = booking_date
+            await update.message.reply_text(f"📅 Выбрана дата: {booking_date.strftime('%d.%m.%Y')}\n\n🕐 Введите время начала (например: 14:30):")
+            return ENTERING_START_TIME
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат даты. Введите дату в формате ДД.ММ.ГГГГ:")
+            return ENTERING_MANUAL_DATE
+
+    async def enter_start_time(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            start_time = datetime.strptime(update.message.text.strip(), '%H:%M').time()
+            context.user_data['booking_start_time'] = start_time
+            await update.message.reply_text("🕐 Введите время окончания (например: 16:00):")
+            return ENTERING_END_TIME
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат времени. Введите в формате ЧЧ:ММ:")
+            return ENTERING_START_TIME
+
+    async def enter_end_time(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            end_time = datetime.strptime(update.message.text.strip(), '%H:%M').time()
+            if end_time <= context.user_data['booking_start_time']:
+                await update.message.reply_text("❌ Время окончания должно быть позже времени начала:")
+                return ENTERING_END_TIME
+            context.user_data['booking_end_time'] = end_time
+            await self.show_booking_confirmation(update, context)
+            return CONFIRMING_BOOKING
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат времени. Введите в формате ЧЧ:ММ:")
+            return ENTERING_END_TIME
+
+    async def show_booking_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        ud = context.user_data
+        room_name = ud.get('booking_room', {}).get('name', '?')
+        text = (
+            f"📋 **Сводка бронирования**\n\n"
+            f"🏢 **Аудитория:** {room_name}\n"
+            f"👤 **ФИО:** {ud.get('booking_full_name')}\n"
+            f"🎯 **Цель:** {ud.get('booking_purpose')}\n"
+            f"📅 **Дата:** {ud.get('booking_date').strftime('%d.%m.%Y')}\n"
+            f"🕐 **Время:** {ud.get('booking_start_time').strftime('%H:%M')} - {ud.get('booking_end_time').strftime('%H:%M')}\n\n"
+            "Все верно?"
+        )
+        await update.message.reply_text(text, reply_markup=Keyboards.get_booking_confirmation_keyboard(), parse_mode='Markdown')
+
+    async def confirm_booking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+
+        # Убедимся, что пользователь есть в БД
+        user = update.effective_user
+        self.db.get_or_create_user(user)
+
+        # Собираем все данные из user_data
+        ud = context.user_data
+        room_id = ud.get('booking_room_id')
+        full_name = ud.get('booking_full_name')
+        purpose = ud.get('booking_purpose')
+        booking_date = ud.get('booking_date')
+        start_time = ud.get('booking_start_time')
+        end_time = ud.get('booking_end_time')
+
+        try:
+            start_dt = datetime.combine(booking_date, start_time)
+            end_dt = datetime.combine(booking_date, end_time)
+            self.db.create_booking(
+                user,
+                room_id,
+                full_name,
+                purpose,
+                start_dt,
+                end_dt
+            )
+            await query.edit_message_text("✅ **Бронирование подтверждено!**", parse_mode='Markdown')
+        except Exception as e:
+            await query.edit_message_text(f"❌ Ошибка при создании бронирования: {e}")
+        finally:
+            for key in list(context.user_data.keys()):
+                if key.startswith('booking_'):
+                    del context.user_data[key]
+        return ConversationHandler.END
+
+    async def cancel_booking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        for key in list(context.user_data.keys()):
+            if key.startswith('booking_'):
+                del context.user_data[key]
+        text = "❌ Операция отменена."
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.delete_message()
+            await update.callback_query.message.reply_text(text, reply_markup=Keyboards.get_main_menu())
+        else:
+            await update.message.reply_text(text, reply_markup=Keyboards.get_main_menu())
+        return ConversationHandler.END
+
+    async def rewrite_booking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        for key in ['booking_full_name', 'booking_purpose', 'booking_date', 'booking_start_time', 'booking_end_time']:
+            context.user_data.pop(key, None)
+        room_name = context.user_data.get('booking_room', {}).get('name', '?')
+        await query.edit_message_text(f"Данные сброшены. 🏢 Аудитория: {room_name}\n\n👤 Введите ваше ФИО:")
+        return ENTERING_FULL_NAME
+
+    async def show_my_bookings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать активные бронирования пользователя в новом формате."""
+        logging.info("Entering show_my_bookings function")
+        user_id = update.effective_user.id
+        bookings_raw = self.db.get_user_bookings(user_id)
+        logging.info(f"Got {len(bookings_raw)} bookings from DB for user {user_id}")
         
+        if not bookings_raw:
+            await update.message.reply_text("У вас нет активных бронирований.")
+            return
+
+        # Конвертируем строки в datetime объекты
+        bookings = []
+        for b in bookings_raw:
+            b['start_time'] = datetime.fromisoformat(b['start_time'])
+            b['end_time'] = datetime.fromisoformat(b['end_time'])
+            bookings.append(b)
+
+        message = "📅 **Ваши бронирования:**\n\n"
+        
+        # Группируем брони по дате
+        grouped_bookings = groupby(bookings, lambda b: b['start_time'].date())
+        
+        for booking_date, group in grouped_bookings:
+            # Форматируем дату (например: "16 окт")
+            date_str = booking_date.strftime("%d %b").lower()
+            message += f"🗓 **{date_str}**\n"
+            
+            for b in group:
+                start_time = b['start_time'].strftime('%H:%M')
+                end_time = b['end_time'].strftime('%H:%M')
+                purpose = b['purpose']
+                room_name = b['room_name']
+                message += f"    `{start_time}`-`{end_time}` - *{room_name}*: _{purpose}_\n"
+            message += "\n"
+            
+        await update.message.reply_text(message, parse_mode='Markdown')
+        logging.info("Sent my_bookings message to user")
+
+    async def show_all_active_bookings_calendar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data['calendar_context'] = 'active_bookings'
+        now = datetime.now()
+        await update.message.reply_text(
+            "📅 Выберите дату для просмотра бронирований:",
+            reply_markup=booking_calendar.create_calendar(year=now.year, month=now.month)
+        )
+
+    async def handle_calendar_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        data = booking_calendar.parse_callback_data(query.data)
+        action = data.get('action')
+        cal_ctx = context.user_data.get('calendar_context', '')
+
+        if action in ['prev', 'next']:
+            year, month = (data['year'], data['month'])
+            if action == 'prev': year, month = booking_calendar.get_prev_month(year, month)
+            else: year, month = booking_calendar.get_next_month(year, month)
+            await query.edit_message_reply_markup(booking_calendar.create_calendar(year=year, month=month))
+            return SELECTING_DATE if cal_ctx == 'booking_date' else None
+
+        if action == 'select':
+            selected_date = date(data['year'], data['month'], data['day'])
+            if cal_ctx == 'booking_date':
+                context.user_data['booking_date'] = selected_date
+                await query.edit_message_text(f"📅 Дата: {selected_date.strftime('%d.%m.%Y')}\n\n🕐 Введите время начала (ЧЧ:ММ):")
+                return ENTERING_START_TIME
+            elif cal_ctx == 'active_bookings':
+                await self.show_active_bookings_for_date(update, context, selected_date)
+                return None
+            elif cal_ctx == 'admin_contacts':
+                return await self.admin_show_contacts_for_date(update, context, selected_date)
+            elif cal_ctx == 'admin_delete':
+                return await self.admin_show_bookings_to_delete(update, context, selected_date)
+
+        # Возвращаем нужное состояние в зависимости от контекста
+        if cal_ctx == 'booking_date':
+            return SELECTING_DATE
+        elif cal_ctx == 'admin_contacts':
+            return ADMIN_SELECT_CONTACTS_DATE
+        elif cal_ctx == 'admin_delete':
+            return ADMIN_SELECT_DELETE_DATE
+        return None
+
+    async def show_active_bookings_for_date(self, update: Update, context: ContextTypes.DEFAULT_TYPE, selected_date):
+        query = update.callback_query
+        bookings_raw = self.db.get_bookings_for_date(selected_date)
+        if not bookings_raw:
+            text = f"📋 На {selected_date.strftime('%d.%m.%Y')} нет бронирований."
+        else:
+            text = f"📋 Бронирования на {selected_date.strftime('%d.%m.%Y')}:\n\n"
+            for b in bookings_raw:
+                room = self.db.get_room_by_id(b['room_id'])
+                start_time_dt = datetime.fromisoformat(b['start_time'])
+                end_time_dt = datetime.fromisoformat(b['end_time'])
+                text += f"🏢 **{room.get('name', '?')}** ({start_time_dt.strftime('%H:%M')}-{end_time_dt.strftime('%H:%M')})\n"
+                text += f"👤 {b['full_name']}\n🎯 {b['purpose']}\n\n"
+        await query.edit_message_text(text, reply_markup=Keyboards.get_back_to_calendar_keyboard(), parse_mode='Markdown')
+
+    async def show_floor_rooms(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        floor = int(query.data.split('_')[1])
+        rooms = self.db.get_rooms_by_floor(floor)
+        if not rooms:
+            await query.edit_message_text(f"❌ На {floor} этаже нет аудиторий.", reply_markup=Keyboards.get_floors_keyboard())
+            return
+        await query.edit_message_text(f"🏢 Аудитории на {floor} этаже:", reply_markup=Keyboards.get_rooms_keyboard(rooms, floor))
+
+    async def show_room_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
         room_id = int(query.data.split('_')[1])
         room = self.db.get_room_by_id(room_id)
-        
         if not room:
             await query.edit_message_text("❌ Аудитория не найдена.")
             return
-        
-        # Формируем описание аудитории
-        description = f"""
-🏢 **{room.get('name', f'Аудитория {room['room_number']}')}**
+        text = (
+            f"🏢 **{room.get('name', 'Аудитория')}**\n\n"
+            f"📍 **Этаж:** {room.get('floor', '-')}\n"
+            f"👥 **Вместимость:** {room.get('capacity', '-')} чел.\n"
+            f"🔧 **Оборудование:** {room.get('equipment', '-')}\n"
+            f"📝 **Описание:** {room.get('description', '-')}"
+        )
+        await query.edit_message_text(text, reply_markup=Keyboards.get_room_details_keyboard(room_id), parse_mode='Markdown')
 
-📏 **Размер:** {room['area']} кв.м
-🪑 **Мебель:** {room['chairs']} стульев, {room['tables']} столов
+    async def show_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = (
+            "Справочная информация по боту DAR\n\n"
+            "Этот бот предназначен для бронирования аудиторий в здании DAR.\n\n"
+            "Основные команды:\n"
+            "📅 Забронировать - начать процесс бронирования аудитории.\n"
+            "🗂 Аудитории - просмотр списка всех доступных аудиторий по этажам.\n"
+            "📅 Мои брони - просмотр ваших активных бронирований.\n"
+            "📋 Активные брони - просмотр всех активных бронирований в здании.\n"
+            "🛠 Админ-панель - доступ к функциям администратора (требуется пароль).\n\n"
+            "Контакты для связи:\n"
+            "• Системный администратор: @Serik_Murzaliev\n"
+            "• По вопросам разработки: @m00n33r\n\n"
+            "Если у вас возникли проблемы, пожалуйста, свяжитесь с администратором."
+        )
+        await update.message.reply_text(text=text)
 
-**Оборудование:**
-"""
-        
-        if room.get('monitor'):
-            description += "🖥 Монитор\n"
-        if room.get('flipchart'):
-            description += "📋 Флипчарт\n"
-        if room.get('air_conditioning'):
-            description += "🧊 Кондиционер\n"
-        
-        if room.get('comments'):
-            description += f"\n📝 **Комментарии:** {room['comments']}"
-        
-        # Добавляем фото, если есть
-        if room.get('photo_url'):
-            await query.edit_message_text(
-                description,
-                reply_markup=Keyboards.get_room_details_keyboard(room_id),
-                parse_mode='Markdown'
-            )
-        else:
-            await query.edit_message_text(
-                description,
-                reply_markup=Keyboards.get_room_details_keyboard(room_id),
-                parse_mode='Markdown'
-            )
-    
-    async def start_booking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Начать процесс бронирования"""
+    async def handle_other_callbacks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
-        await query.answer()
-        
-        if 'book_room_' in query.data:
-            room_id = int(query.data.split('_')[2])
-            context.user_data['booking_room_id'] = room_id
-        else:
-            # Если пользователь выбрал "Забронировать" из главного меню
-            await query.edit_message_text(
-                "🏢 Введите номер аудитории для бронирования:",
-                reply_markup=Keyboards.get_cancel_keyboard()
-            )
-            return ENTERING_ROOM_NUMBER
-        
-        await query.edit_message_text(
-            "👤 Введите ваше ФИО:",
-            reply_markup=Keyboards.get_cancel_keyboard()
-        )
-        return ENTERING_FULL_NAME
-    
-    async def enter_room_number(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка ввода номера аудитории"""
-        room_number = update.message.text.strip()
-        
-        # Ищем аудиторию по номеру
-        all_rooms = self.db.get_all_rooms()
-        room = None
-        for r in all_rooms:
-            if str(r['room_number']) == room_number:
-                room = r
-                break
-        
-        if not room:
-            await update.message.reply_text(
-                "❌ Аудитория с таким номером не найдена. Попробуйте еще раз:",
-                reply_markup=Keyboards.get_cancel_keyboard()
-            )
-            return ENTERING_ROOM_NUMBER
-        
-        context.user_data['booking_room_id'] = room['id']
-        await update.message.reply_text(
-            "👤 Введите ваше ФИО:",
-            reply_markup=Keyboards.get_cancel_keyboard()
-        )
-        return ENTERING_FULL_NAME
-    
-    async def enter_full_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка ввода ФИО"""
-        full_name = update.message.text.strip()
-        context.user_data['full_name'] = full_name
-        
-        await update.message.reply_text(
-            "🎯 Введите цель мероприятия:",
-            reply_markup=Keyboards.get_cancel_keyboard()
-        )
-        return ENTERING_PURPOSE
-    
-    async def enter_purpose(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка ввода цели мероприятия"""
-        purpose = update.message.text.strip()
-        context.user_data['purpose'] = purpose
-        
-        await update.message.reply_text(
-            "📅 Введите дату бронирования (формат: ДД.ММ.ГГГГ):",
-            reply_markup=Keyboards.get_cancel_keyboard()
-        )
-        return ENTERING_DATE
-    
-    async def enter_date(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка ввода даты"""
-        date_str = update.message.text.strip()
-        
-        try:
-            booking_date = datetime.strptime(date_str, "%d.%m.%Y").date()
-            if booking_date < date.today():
-                await update.message.reply_text(
-                    "❌ Нельзя бронировать аудиторию на прошедшую дату. Попробуйте еще раз:",
-                    reply_markup=Keyboards.get_cancel_keyboard()
-                )
-                return ENTERING_DATE
-            
-            context.user_data['booking_date'] = booking_date
-            await update.message.reply_text(
-                "🕐 Введите время начала (формат: ЧЧ:ММ):",
-                reply_markup=Keyboards.get_cancel_keyboard()
-            )
-            return ENTERING_START_TIME
-            
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Неверный формат даты. Используйте формат ДД.ММ.ГГГГ:",
-                reply_markup=Keyboards.get_cancel_keyboard()
-            )
-            return ENTERING_DATE
-    
-    async def enter_start_time(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка ввода времени начала"""
-        time_str = update.message.text.strip()
-        
-        try:
-            start_time = datetime.strptime(time_str, "%H:%M").time()
-            context.user_data['start_time'] = start_time
-            
-            await update.message.reply_text(
-                "🕐 Введите время окончания (формат: ЧЧ:ММ):",
-                reply_markup=Keyboards.get_cancel_keyboard()
-            )
-            return ENTERING_END_TIME
-            
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Неверный формат времени. Используйте формат ЧЧ:ММ:",
-                reply_markup=Keyboards.get_cancel_keyboard()
-            )
-            return ENTERING_START_TIME
-    
-    async def enter_end_time(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка ввода времени окончания"""
-        time_str = update.message.text.strip()
-        
-        try:
-            end_time = datetime.strptime(time_str, "%H:%M").time()
-            start_time = context.user_data['start_time']
-            
-            if end_time <= start_time:
-                await update.message.reply_text(
-                    "❌ Время окончания должно быть позже времени начала. Попробуйте еще раз:",
-                    reply_markup=Keyboards.get_cancel_keyboard()
-                )
-                return ENTERING_END_TIME
-            
-            # Проверяем доступность аудитории
-            room_id = context.user_data['booking_room_id']
-            booking_date = context.user_data['booking_date']
-            start_datetime = datetime.combine(booking_date, start_time)
-            end_datetime = datetime.combine(booking_date, end_time)
-            
-            if not self.db.check_room_availability(room_id, start_datetime, end_datetime.isoformat()):
-                await update.message.reply_text(
-                    "❌ Аудитория уже забронирована на это время. Выберите другое время:",
-                    reply_markup=Keyboards.get_cancel_keyboard()
-                )
-                return ENTERING_START_TIME
-            
-            # Показываем подтверждение
-            room = self.db.get_room_by_id(room_id)
-            room_name = room.get('name', f"Аудитория {room['room_number']}")
-            
-            confirmation_text = f"""
-📋 **Подтверждение бронирования**
-
-🏢 **Аудитория:** {room_name}
-👤 **ФИО:** {context.user_data['full_name']}
-🎯 **Цель:** {context.user_data['purpose']}
-📅 **Дата:** {booking_date.strftime('%d.%m.%Y')}
-🕐 **Время:** {start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}
-
-Подтвердите бронирование:
-            """
-            
-            await update.message.reply_text(
-                confirmation_text,
-                reply_markup=Keyboards.get_booking_confirmation_keyboard(
-                    room_id, 
-                    start_datetime.isoformat(), 
-                    end_datetime.isoformat()
-                ),
-                parse_mode='Markdown'
-            )
-            return ConversationHandler.END
-            
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Неверный формат времени. Используйте формат ЧЧ:ММ:",
-                reply_markup=Keyboards.get_cancel_keyboard()
-            )
-            return ENTERING_END_TIME
-    
-    async def confirm_booking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Подтверждение бронирования"""
-        query = update.callback_query
-        await query.answer()
-        
-        # Парсим данные из callback_data
-        data_parts = query.data.split('_')
-        room_id = int(data_parts[2])
-        start_time = datetime.fromisoformat(data_parts[3])
-        end_time = datetime.fromisoformat(data_parts[4])
-        
-        user_id = update.effective_user.id
-        full_name = context.user_data.get('full_name', '')
-        purpose = context.user_data.get('purpose', '')
-        
-        # Создаем бронирование
-        booking = self.db.create_booking(user_id, room_id, full_name, purpose, start_time, end_time)
-        
-        if booking:
-            room = self.db.get_room_by_id(room_id)
-            room_name = room.get('name', f"Аудитория {room['room_number']}")
-            
-            success_text = f"""
-✅ **Бронирование подтверждено!**
-
-🏢 **Аудитория:** {room_name}
-👤 **ФИО:** {full_name}
-🎯 **Цель:** {purpose}
-📅 **Дата:** {start_time.strftime('%d.%m.%Y')}
-🕐 **Время:** {start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}
-
-Ваша заявка принята и обрабатывается.
-            """
-            
-            await query.edit_message_text(
-                success_text,
-                reply_markup=Keyboards.get_main_menu(),
-                parse_mode='Markdown'
-            )
-        else:
-            await query.edit_message_text(
-                "❌ Ошибка при создании бронирования. Попробуйте еще раз.",
-                reply_markup=Keyboards.get_main_menu()
-            )
-    
-    async def show_my_bookings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать бронирования пользователя"""
-        user_id = update.effective_user.id
-        bookings = self.db.get_user_bookings(user_id)
-        
-        if not bookings:
-            await update.message.reply_text(
-                "📭 У вас нет активных бронирований.",
-                reply_markup=Keyboards.get_main_menu()
-            )
+        if query.data.startswith("cal_"):
+            await self.handle_calendar_callback(update, context)
             return
-        
-        # Группируем бронирования по дате
-        bookings_by_date = {}
-        for booking in bookings:
-            start_time = datetime.fromisoformat(booking['start_time'])
-            date_key = start_time.strftime('%d.%m.%Y')
-            if date_key not in bookings_by_date:
-                bookings_by_date[date_key] = []
-            bookings_by_date[date_key].append(booking)
-        
-        # Формируем текст
-        text = "📋 **Ваши активные бронирования:**\n\n"
-        
-        for date_key in sorted(bookings_by_date.keys()):
-            text += f"📅 **{date_key}:**\n"
-            for booking in bookings_by_date[date_key]:
-                room = booking['rooms']
-                room_name = room.get('name', f"Аудитория {room['room_number']}")
-                start_time = datetime.fromisoformat(booking['start_time'])
-                end_time = datetime.fromisoformat(booking['end_time'])
-                
-                text += f"  🏢 {room_name}\n"
-                text += f"  🕐 {start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}\n"
-                text += f"  🎯 {booking['purpose']}\n\n"
-        
-        await update.message.reply_text(
-            text,
-            reply_markup=Keyboards.get_main_menu(),
-            parse_mode='Markdown'
-        )
-    
-    async def show_admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать админ-панель"""
-        user_id = update.effective_user.id
-        
-        if self.db.is_user_admin(user_id):
-            await update.message.reply_text(
-                "🛠 **Админ-панель**\n\nВыберите действие:",
-                reply_markup=Keyboards.get_admin_menu(),
-                parse_mode='Markdown'
+        await query.answer()
+        if query.data.startswith("floor_"): await self.show_floor_rooms(update, context)
+        elif query.data.startswith("room_"): await self.show_room_details(update, context)
+        elif query.data == "back_to_floors": await query.edit_message_text("🏢 Выберите этаж:", reply_markup=Keyboards.get_floors_keyboard())
+        elif query.data == "back_to_calendar":
+            context.user_data['calendar_context'] = 'active_bookings'
+            now = datetime.now()
+            await query.edit_message_text(
+                "📅 Выберите дату для просмотра бронирований:",
+                reply_markup=booking_calendar.create_calendar(year=now.year, month=now.month)
             )
+        elif query.data == "back_to_main":
+            await query.answer()
+            await query.delete_message()
+            await query.message.reply_text("🏠 Главное меню:", reply_markup=Keyboards.get_main_menu())
+
+
+    async def show_admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать админ-панель или запросить пароль. Работает и с message, и с callback_query."""
+        query = update.callback_query
+        user = update.effective_user
+
+        async def reply(text, reply_markup):
+            if query:
+                await query.answer()
+                await query.edit_message_text(text, reply_markup=reply_markup)
+            else:
+                await update.message.reply_text(text, reply_markup=reply_markup)
+
+        if self.db.is_user_admin(user.id):
+            await reply(
+                "🛠 Админ-панель\n\nВыберите действие:",
+                reply_markup=Keyboards.get_admin_menu()
+            )
+            return ADMIN_MAIN
         else:
-            await update.message.reply_text(
-                "🔐 Для доступа к админ-панели введите пароль администратора:",
-                reply_markup=Keyboards.get_cancel_keyboard()
+            await reply(
+                "🔐 Для доступа к админ-панели введите пароль:",
+                reply_markup=None
             )
             return ADMIN_PASSWORD
-    
+
+
     async def check_admin_password(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Проверка пароля администратора"""
-        password = update.message.text.strip()
+        """Проверить пароль администратора."""
         user_id = update.effective_user.id
-        
+        password = update.message.text.strip()
+
         if self.db.check_admin_password(user_id, password):
             await update.message.reply_text(
                 "✅ Доступ разрешен! Добро пожаловать в админ-панель.",
@@ -416,150 +448,252 @@ class Handlers:
             return ConversationHandler.END
         else:
             await update.message.reply_text(
-                "❌ Неверный пароль. Попробуйте еще раз или нажмите Отмена:",
-                reply_markup=Keyboards.get_cancel_keyboard()
+                "❌ Неверный пароль. Попробуйте еще раз или вернитесь в главное меню."
             )
             return ADMIN_PASSWORD
-    
-    async def show_all_bookings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать все бронирования (для админов)"""
+
+    async def exit_admin_panel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выход из админ-панели."""
         query = update.callback_query
         await query.answer()
+        await query.delete_message()
+        await query.message.reply_text("Возвращаю в главное меню.", reply_markup=Keyboards.get_main_menu())
+        return ConversationHandler.END
+
+    async def show_admin_panel_and_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Прерывает текущий диалог (например, бронирование) и передает управление дальше."""
+        for key in list(context.user_data.keys()):
+            if key.startswith('booking_'):
+                del context.user_data[key]
+        return ConversationHandler.END
+
+    # --- Добавление аудитории ---
+    async def admin_add_room_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text(
+            "➕ Добавление аудитории\n\nВыберите этаж:",
+            reply_markup=Keyboards.get_add_room_keyboard()
+        )
+        return ADMIN_ADDING_ROOM_FLOOR
+
+    async def admin_add_room_get_floor(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        floor = int(query.data.split("_")[-1])
+        context.user_data['admin_add_floor'] = floor
+        await query.edit_message_text(f"Этаж {floor}. Теперь введите номер аудитории (например, 214):")
+        return ADMIN_ADDING_ROOM_NUMBER
+
+    async def admin_add_room_get_number(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data['admin_add_number'] = update.message.text.strip()
+        await update.message.reply_text("Введите название аудитории (например, Конференц-зал):")
+        return ADMIN_ADDING_ROOM_NAME
+
+    async def admin_add_room_get_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data['admin_add_name'] = update.message.text.strip()
+        await update.message.reply_text("Введите вместимость (просто число):")
+        return ADMIN_ADDING_ROOM_CAPACITY
+
+    async def admin_add_room_get_capacity(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data['admin_add_capacity'] = int(update.message.text.strip())
+        await update.message.reply_text("Введите оборудование (через запятую):")
+        return ADMIN_ADDING_ROOM_EQUIPMENT
         
-        user_id = update.effective_user.id
-        if not self.db.is_user_admin(user_id):
-            await query.edit_message_text("❌ Доступ запрещен.")
-            return
+    async def admin_add_room_get_equipment(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data['admin_add_equipment'] = update.message.text.strip()
+        await update.message.reply_text("Введите краткое описание аудитории:")
+        return ADMIN_ADDING_ROOM_DESCRIPTION
+
+    async def admin_add_room_finish(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        ud = context.user_data
+        success = self.db.create_room(
+            room_number=ud['admin_add_number'],
+            name=ud['admin_add_name'],
+            floor=ud['admin_add_floor'],
+            capacity=ud['admin_add_capacity'],
+            equipment=ud['admin_add_equipment'],
+            description=update.message.text.strip()
+        )
+        if success:
+            await update.message.reply_text("✅ Аудитория успешно добавлена!", reply_markup=Keyboards.get_admin_menu())
+        else:
+            await update.message.reply_text("❌ Ошибка при добавлении аудитории.", reply_markup=Keyboards.get_admin_menu())
+
+        # Clear admin_add_... keys
+        for key in list(ud.keys()):
+            if key.startswith('admin_add_'):
+                del ud[key]
+        return ADMIN_MAIN
         
-        bookings = self.db.get_all_bookings()
+    # --- Контакты пользователей ---
+    async def admin_contacts_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        context.user_data['calendar_context'] = 'admin_contacts'
+        now = datetime.now()
+        await query.edit_message_text(
+            "👥 Контакты пользователей\n\nВыберите дату для просмотра:",
+            reply_markup=booking_calendar.create_calendar(year=now.year, month=now.month)
+        )
+        return ADMIN_SELECT_CONTACTS_DATE
+
+    async def admin_show_contacts_for_date(self, update: Update, context: ContextTypes.DEFAULT_TYPE, selected_date):
+        query = update.callback_query
+        bookings = self.db.get_bookings_for_date(selected_date)
         
         if not bookings:
-            await query.edit_message_text(
-                "📭 Нет активных бронирований.",
-                reply_markup=Keyboards.get_admin_menu()
-            )
-            return
-        
-        # Показываем первые 10 бронирований
-        text = "📊 **Все бронирования:**\n\n"
-        
-        for i, booking in enumerate(bookings[:10]):
-            room = booking['rooms']
-            room_name = room.get('name', f"Аудитория {room['room_number']}")
-            start_time = datetime.fromisoformat(booking['start_time'])
-            end_time = datetime.fromisoformat(booking['end_time'])
-            
-            text += f"{i+1}. 🏢 {room_name}\n"
-            text += f"   👤 {booking['full_name']}\n"
-            text += f"   📅 {start_time.strftime('%d.%m.%Y %H:%M')} - {end_time.strftime('%H:%M')}\n"
-            text += f"   🎯 {booking['purpose']}\n"
-            text += f"   📊 Статус: {booking['status']}\n\n"
-        
-        if len(bookings) > 10:
-            text += f"... и еще {len(bookings) - 10} бронирований"
-        
-        await query.edit_message_text(
-            text,
-            reply_markup=Keyboards.get_admin_menu(),
-            parse_mode='Markdown'
-        )
-    
-    async def show_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать справку"""
-        help_text = """
-ℹ️ **Справка по использованию бота**
+            text = f"На {selected_date.strftime('%d.%m.%Y')} нет бронирований."
+        else:
+            text = f"📋 Бронирования на {selected_date.strftime('%d.%m.%Y')}:\n\n"
+            for b in bookings:
+                user = self.db.get_user_by_id(b['user_id'])
+                room = self.db.get_room_by_id(b['room_id'])
+                
+                username = f"@{user['username']}" if user else "скрыт"
+                user_full_name = user.get('full_name', "Неизвестный") if user else "Неизвестный"
+                room_name = room.get('name', 'Неизвестная аудитория') if room else 'Неизвестная аудитория'
+                
+                start_time_dt = datetime.fromisoformat(b['start_time'])
+                end_time_dt = datetime.fromisoformat(b['end_time'])
+                
+                start_time_str = start_time_dt.strftime('%H:%M')
+                end_time_str = end_time_dt.strftime('%H:%M')
+                
+                text += f"**{room_name}** ({start_time_str}-{end_time_str})\n"
+                text += f"👤 {user_full_name} ({username})\n"
+                text += f"🎯 {b.get('purpose', 'Цель не указана')}\n\n"
 
-🗂 **Аудитории** - просмотр информации о доступных аудиториях по этажам
-📅 **Забронировать** - забронировать аудиторию на определенное время
-🔎 **Мои брони** - просмотр ваших активных бронирований
-🛠 **Админ-панель** - управление системой (требует пароль администратора)
+        await query.edit_message_text(text, reply_markup=Keyboards.get_back_to_admin_keyboard(), parse_mode='Markdown')
+        return ADMIN_MAIN
 
-**Как забронировать аудиторию:**
-1. Выберите "📅 Забронировать"
-2. Введите номер аудитории
-3. Укажите ваше ФИО
-4. Опишите цель мероприятия
-5. Выберите дату и время
-6. Подтвердите бронирование
-
-**Поддержка:** Обратитесь к администратору системы
-        """
-        
-        await update.message.reply_text(
-            help_text,
-            reply_markup=Keyboards.get_main_menu(),
-            parse_mode='Markdown'
-        )
-    
-    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик callback-запросов"""
+    # --- Удаление бронирований ---
+    async def admin_delete_booking_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
-        
-        if query.data == "back_to_main":
-            await query.edit_message_text(
-                "🏠 Главное меню:",
-                reply_markup=Keyboards.get_main_menu()
-            )
-        elif query.data == "back_to_floors":
-            await query.edit_message_text(
-                "🏢 Выберите этаж для просмотра аудиторий:",
-                reply_markup=Keyboards.get_floors_keyboard()
-            )
-        elif query.data == "back_to_rooms":
-            floor = context.user_data.get('selected_floor', 2)
-            rooms = context.user_data.get('rooms', [])
-            await query.edit_message_text(
-                f"🏢 Аудитории на {floor} этаже:",
-                reply_markup=Keyboards.get_rooms_keyboard(rooms, floor)
-            )
-        elif query.data == "cancel":
-            await query.edit_message_text(
-                "❌ Операция отменена.",
-                reply_markup=Keyboards.get_main_menu()
-            )
-        elif query.data == "cancel_booking":
-            await query.edit_message_text(
-                "❌ Бронирование отменено.",
-                reply_markup=Keyboards.get_main_menu()
-            )
-        elif query.data.startswith("admin_all_bookings"):
-            await self.show_all_bookings(update, context)
-        elif query.data.startswith("admin_all_users"):
-            await query.edit_message_text(
-                "👥 **Все пользователи**\n\nФункция в разработке.",
-                reply_markup=Keyboards.get_admin_menu(),
-                parse_mode='Markdown'
-            )
-        elif query.data.startswith("confirm_booking"):
-            await self.confirm_booking(update, context)
-    
-    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик текстовых сообщений"""
-        text = update.message.text
-        
-        if text == "🗂 Аудитории":
-            await self.show_rooms(update, context)
-        elif text == "📅 Забронировать":
-            await update.message.reply_text(
-                "🏢 Введите номер аудитории для бронирования:",
-                reply_markup=Keyboards.get_cancel_keyboard()
-            )
-            return ENTERING_ROOM_NUMBER
-        elif text == "🔎 Мои брони":
-            await self.show_my_bookings(update, context)
-        elif text == "🛠 Админ-панель":
-            await self.show_admin_panel(update, context)
-        elif text == "ℹ️ Помощь":
-            await self.show_help(update, context)
+        context.user_data['calendar_context'] = 'admin_delete'
+        now = datetime.now()
+        await query.edit_message_text(
+            "📅 Удаление бронирования\n\nВыберите дату для просмотра броней:",
+            reply_markup=booking_calendar.create_calendar(year=now.year, month=now.month)
+        )
+        return ADMIN_SELECT_DELETE_DATE
+
+    async def admin_show_bookings_to_delete(self, update: Update, context: ContextTypes.DEFAULT_TYPE, selected_date):
+        query = update.callback_query
+        bookings = self.db.get_bookings_for_date(selected_date)
+        context.user_data['admin_delete_date'] = selected_date
+
+        if not bookings:
+            text = f"На {selected_date.strftime('%d.%m.%Y')} нет бронирований для удаления."
+            keyboard = Keyboards.get_back_to_admin_keyboard()
         else:
-            # Если это не команда меню, проверяем состояние пользователя
-            user_id = update.effective_user.id
-            if user_id in self.user_states:
-                # Обрабатываем ввод в зависимости от состояния
-                pass
-            else:
-                await update.message.reply_text(
-                    "Выберите действие из главного меню:",
-                    reply_markup=Keyboards.get_main_menu()
-                )
+            text = f"Выберите бронирование для удаления на {selected_date.strftime('%d.%m.%Y')}:"
+            keyboard = Keyboards.get_delete_booking_keyboard(bookings)
+
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return ADMIN_MAIN
+
+    async def admin_confirm_delete_booking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        booking_id = int(query.data.split("_")[-1])
+        
+        success = self.db.delete_booking(booking_id)
+        if success:
+            text = "✅ Бронирование успешно удалено."
+        else:
+            text = "❌ Не удалось удалить бронирование."
+
+        # Показать обновленный список
+        selected_date = context.user_data.get('admin_delete_date')
+        if selected_date:
+            return await self.admin_show_bookings_to_delete(update, context, selected_date)
+        else:
+            await query.edit_message_text(text, reply_markup=Keyboards.get_back_to_admin_keyboard())
+            return ADMIN_MAIN
+
+    # --- Редактирование аудиторий ---
+    async def admin_edit_room_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text(
+            "✏️ Редактирование аудитории\n\nВыберите этаж:",
+            reply_markup=Keyboards.get_edit_room_floor_keyboard()
+        )
+        return ADMIN_EDIT_SELECT_FLOOR
+
+    async def admin_edit_select_floor(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        floor = int(query.data.split("_")[-1])
+        rooms = self.db.get_rooms_by_floor(floor)
+        await query.edit_message_text(
+            f"Этаж {floor}. Выберите аудиторию для редактирования:",
+            reply_markup=Keyboards.get_edit_room_select_keyboard(rooms)
+        )
+        return ADMIN_EDIT_SELECT_ROOM
+
+    async def admin_edit_select_room(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        room_id = int(query.data.split("_")[-1])
+        context.user_data['admin_edit_room_id'] = room_id
+        room = self.db.get_room_by_id(room_id)
+        
+        text = f"Выбрана аудитория: *{room['name']}*\. Что вы хотите изменить?"
+        await query.edit_message_text(
+            text,
+            reply_markup=Keyboards.get_edit_field_keyboard(room_id),
+            parse_mode='MarkdownV2'
+        )
+        return ADMIN_EDIT_SELECT_FIELD
+
+    async def admin_edit_select_field(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        field = query.data.split("_")[-1]
+        context.user_data['admin_edit_field'] = field
+        
+        await query.edit_message_text(f"Введите новое значение для '{field}':")
+        return ADMIN_EDIT_SET_NEW_VALUE
+
+    async def admin_edit_set_new_value(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        new_value = update.message.text.strip()
+        room_id = context.user_data['admin_edit_room_id']
+        field = context.user_data['admin_edit_field']
+
+        success = self.db.update_room_field(room_id, field, new_value)
+        if success:
+            text = "✅ Данные аудитории успешно обновлены."
+        else:
+            text = "❌ Ошибка при обновлении."
+            
+        await update.message.reply_text(text, reply_markup=Keyboards.get_admin_menu())
+        
+        # Очистка
+        for key in list(context.user_data.keys()):
+            if key.startswith('admin_edit_'):
+                del context.user_data[key]
+                
+        return ADMIN_MAIN
+
+    # Wrapper functions for fallbacks
+    async def show_rooms_and_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self.show_rooms(update, context)
+        return ConversationHandler.END
+        
+    async def show_my_bookings_and_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self.show_my_bookings(update, context)
+        return ConversationHandler.END
+
+    async def show_all_active_bookings_calendar_and_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self.show_all_active_bookings_calendar(update, context)
+        return ConversationHandler.END
+
+    async def show_help_and_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self.show_help(update, context)
+        return ConversationHandler.END
+        
+    async def show_admin_panel_and_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Прервать бронирование и показать админ-панель."""
+        for key in list(context.user_data.keys()):
+            if key.startswith('booking_'):
+                del context.user_data[key]
+        return await self.show_admin_panel(update, context)
