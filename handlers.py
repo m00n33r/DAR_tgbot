@@ -1,6 +1,6 @@
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ConversationHandler, ContextTypes
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from database_sqlite import DatabaseManager
 from keyboards import Keyboards
 from calendar_widget import booking_calendar
@@ -165,8 +165,13 @@ class Handlers:
                 await update.message.reply_text("❌ Время окончания должно быть позже времени начала:")
                 return ENTERING_END_TIME
             context.user_data['booking_end_time'] = end_time
-            await self.show_booking_confirmation(update, context)
-            return CONFIRMING_BOOKING
+            # Переход к выбору повторяемости
+            await update.message.reply_text(
+                "🔁 Хотите повторять бронирование?",
+                reply_markup=Keyboards.get_recurrence_keyboard()
+            )
+            context.user_data['booking_recurrence'] = 'none'
+            return SELECTING_DATE
         except ValueError:
             await update.message.reply_text("❌ Неверный формат времени. Введите в формате ЧЧ:ММ:")
             return ENTERING_END_TIME
@@ -179,6 +184,8 @@ class Handlers:
         booking_date = ud.get('booking_date')
         start_time = ud.get('booking_start_time')
         end_time = ud.get('booking_end_time')
+        recurrence = ud.get('booking_recurrence', 'none')
+        recurrence_until = ud.get('booking_recurrence_until')
         
         text = (
             f"📋 Сводка бронирования\n\n"
@@ -186,10 +193,34 @@ class Handlers:
             f"👤 ФИО: {full_name}\n"
             f"🎯 Цель: {purpose}\n"
             f"📅 Дата: {booking_date.strftime('%d.%m.%Y')}\n"
-            f"🕐 Время: {start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}\n\n"
+            f"🕐 Время: {start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}\n"
+            f"🔁 Повторение: {self._format_recurrence(recurrence, recurrence_until)}\n\n"
             "Все верно?"
         )
         await update.message.reply_text(text, reply_markup=Keyboards.get_booking_confirmation_keyboard())
+
+    async def show_booking_confirmation_from_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        ud = context.user_data
+        room_name = ud.get('booking_room', {}).get('name', '?')
+        full_name = ud.get('booking_full_name', '')
+        purpose = ud.get('booking_purpose', '')
+        booking_date = ud.get('booking_date')
+        start_time = ud.get('booking_start_time')
+        end_time = ud.get('booking_end_time')
+        recurrence = ud.get('booking_recurrence', 'none')
+        recurrence_until = ud.get('booking_recurrence_until')
+
+        text = (
+            f"📋 Сводка бронирования\n\n"
+            f"🏢 Аудитория: {room_name}\n"
+            f"👤 ФИО: {full_name}\n"
+            f"🎯 Цель: {purpose}\n"
+            f"📅 Дата: {booking_date.strftime('%d.%m.%Y')}\n"
+            f"🕐 Время: {start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}\n"
+            f"🔁 Повторение: {self._format_recurrence(recurrence, recurrence_until)}\n\n"
+            "Все верно?"
+        )
+        await update.callback_query.edit_message_text(text, reply_markup=Keyboards.get_booking_confirmation_keyboard())
 
     async def confirm_booking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -211,15 +242,51 @@ class Handlers:
         try:
             start_dt = datetime.combine(booking_date, start_time)
             end_dt = datetime.combine(booking_date, end_time)
-            self.db.create_booking(
-                user,
+            recurrence = ud.get('booking_recurrence', 'none')
+            recurrence_until = ud.get('booking_recurrence_until')
+
+            if recurrence != 'none' and recurrence_until:
+                group_id = f"{user.id}-{room_id}-{int(datetime.now().timestamp())}"
+                current_date = booking_date
+                created = 0
+                while current_date <= recurrence_until:
+                    s_dt = datetime.combine(current_date, start_time)
+                    e_dt = datetime.combine(current_date, end_time)
+                    if self.db.check_room_availability(room_id, s_dt, e_dt):
+                        self.db.create_booking(
+                            user,
+                            room_id,
+                            full_name,
+                            purpose,
+                            s_dt,
+                            e_dt,
+                            recurrence_type=recurrence,
+                            recurrence_until=datetime.combine(recurrence_until, end_time),
+                            recurrence_group=group_id
+                        )
+                        created += 1
+                    # шаг интервала
+                    if recurrence == 'weekly':
+                        current_date = date.fromordinal(current_date.toordinal() + 7)
+                    elif recurrence == 'biweekly':
+                        current_date = date.fromordinal(current_date.toordinal() + 14)
+                    elif recurrence == 'monthly':
+                        # переход на следующий месяц, безопасно ограничиваем днем 28
+                        year = current_date.year + (current_date.month // 12)
+                        month = (current_date.month % 12) + 1
+                        day = min(current_date.day, 28)
+                        current_date = date(year, month, day)
+                await query.edit_message_text(f"✅ Создано бронирований: {created}")
+            else:
+                self.db.create_booking(
+                    user,
                     room_id, 
-                full_name,
-                purpose,
-                start_dt,
-                end_dt
-            )
-            await query.edit_message_text("✅ **Бронирование подтверждено!**", parse_mode='Markdown')
+                    full_name,
+                    purpose,
+                    start_dt,
+                    end_dt
+                )
+                await query.edit_message_text("✅ **Бронирование подтверждено!**", parse_mode='Markdown')
         except Exception as e:
             await query.edit_message_text(f"❌ Ошибка при создании бронирования: {e}")
         finally:
@@ -227,6 +294,18 @@ class Handlers:
                 if key.startswith('booking_'):
                     del context.user_data[key]
             return ConversationHandler.END
+
+    def _format_recurrence(self, rec_type: str, until) -> str:
+        mapping = {
+            'none': 'Единоразово',
+            'weekly': 'Раз в неделю',
+            'biweekly': 'Раз в 2 недели',
+            'monthly': 'Раз в месяц'
+        }
+        base = mapping.get(rec_type, 'Единоразово')
+        if rec_type != 'none' and until:
+            return f"{base} до {until.strftime('%d.%m.%Y')}"
+        return base
             
     async def cancel_booking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         for key in list(context.user_data.keys()):
@@ -324,6 +403,18 @@ class Handlers:
                 return await self.admin_show_contacts_for_date(update, context, selected_date)
             elif cal_ctx == 'admin_delete':
                 return await self.admin_show_bookings_to_delete(update, context, selected_date)
+            elif cal_ctx == 'recurrence_until':
+                base_date = context.user_data.get('booking_date')
+                if base_date and selected_date < base_date:
+                    await query.edit_message_text(
+                        "❌ Дата окончания не может быть раньше даты начала. Выберите другую дату:",
+                        reply_markup=booking_calendar.create_calendar(year=base_date.year, month=base_date.month)
+                    )
+                    return SELECTING_DATE
+                context.user_data['booking_recurrence_until'] = selected_date
+                # показываем сводку через callback
+                await self.show_booking_confirmation_from_callback(update, context)
+                return CONFIRMING_BOOKING
 
         # Возвращаем нужное состояние в зависимости от контекста
         if cal_ctx == 'booking_date':
@@ -333,6 +424,33 @@ class Handlers:
         elif cal_ctx == 'admin_delete':
             return ADMIN_SELECT_DELETE_DATE
         return None
+
+    async def handle_recurrence_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка кнопок выбора повторения: recurrence_none|weekly|biweekly|monthly"""
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+        if not data.startswith('recurrence_'):
+            return
+        rec_type = data.split('_', 1)[1]  # none|weekly|biweekly|monthly
+        # Нормализуем значения
+        if rec_type not in ['none', 'weekly', 'biweekly', 'monthly']:
+            rec_type = 'none'
+        context.user_data['booking_recurrence'] = rec_type
+
+        if rec_type == 'none':
+            # Покажем сводку сразу
+            await self.show_booking_confirmation_from_callback(update, context)
+            return CONFIRMING_BOOKING
+
+        # Попросим указать дату окончания повторений
+        now = datetime.now()
+        context.user_data['calendar_context'] = 'recurrence_until'
+        await query.edit_message_text(
+            "📅 Выберите дату окончания повторений (включительно):",
+            reply_markup=booking_calendar.create_calendar(year=now.year, month=now.month)
+        )
+        return SELECTING_DATE
 
     async def show_active_bookings_for_date(self, update: Update, context: ContextTypes.DEFAULT_TYPE, selected_date):
         query = update.callback_query
@@ -417,6 +535,9 @@ class Handlers:
         query = update.callback_query
         if query.data.startswith("cal_"):
             await self.handle_calendar_callback(update, context)
+            return
+        if query.data.startswith('recurrence_'):
+            await self.handle_recurrence_callback(update, context)
             return
         await query.answer()
         if query.data.startswith("floor_"): await self.show_floor_rooms(update, context)

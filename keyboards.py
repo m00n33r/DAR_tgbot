@@ -63,6 +63,18 @@ class Keyboards:
             [InlineKeyboardButton("❌ Отклонить", callback_data="cancel_booking")]
         ]
         return InlineKeyboardMarkup(keyboard)
+
+    @staticmethod
+    def get_recurrence_keyboard() -> InlineKeyboardMarkup:
+        """Клавиатура выбора повторения бронирования"""
+        keyboard = [
+            [InlineKeyboardButton("🟢 Единоразово", callback_data="recurrence_none")],
+            [InlineKeyboardButton("🔁 Раз в неделю", callback_data="recurrence_weekly")],
+            [InlineKeyboardButton("🔁 Раз в 2 недели", callback_data="recurrence_biweekly")],
+            [InlineKeyboardButton("🗓 Раз в месяц", callback_data="recurrence_monthly")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="rewrite_booking")]
+        ]
+        return InlineKeyboardMarkup(keyboard)
     
     @staticmethod
     def get_admin_menu():

@@ -58,16 +58,33 @@ class DatabaseManager:
                     start_time TIMESTAMP NOT NULL,
                     end_time TIMESTAMP NOT NULL,
                     status TEXT DEFAULT 'pending',
+                    recurrence_type TEXT DEFAULT 'none',
+                    recurrence_until TIMESTAMP NULL,
+                    recurrence_group TEXT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users (id),
                     FOREIGN KEY (room_id) REFERENCES rooms (id)
                 )
             ''')
+            # Миграции для существующих БД (добавление колонок, если их нет)
+            try:
+                cursor.execute("ALTER TABLE bookings ADD COLUMN recurrence_type TEXT DEFAULT 'none'")
+            except Exception:
+                pass
+            try:
+                cursor.execute("ALTER TABLE bookings ADD COLUMN recurrence_until TIMESTAMP NULL")
+            except Exception:
+                pass
+            try:
+                cursor.execute("ALTER TABLE bookings ADD COLUMN recurrence_group TEXT NULL")
+            except Exception:
+                pass
             
             # Создаем индексы для оптимизации
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_rooms_floor ON rooms(floor)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_bookings_room_time ON bookings(room_id, start_time, end_time)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_bookings_user ON bookings(user_id)')
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_bookings_recurrence_group ON bookings(recurrence_group)")
             
             conn.commit()
             
@@ -254,7 +271,9 @@ class DatabaseManager:
     
     # Методы для работы с бронированиями
     def create_booking(self, user, room_id: int, full_name: str, 
-                       purpose: str, start_time: datetime, end_time: datetime) -> Dict:
+                       purpose: str, start_time: datetime, end_time: datetime,
+                       recurrence_type: str = 'none', recurrence_until: Optional[datetime] = None,
+                       recurrence_group: Optional[str] = None) -> Dict:
         """Создать новое бронирование"""
         db_user = self.get_or_create_user(user)
         if not db_user:
@@ -269,8 +288,11 @@ class DatabaseManager:
                 return {}
 
             query = '''
-                INSERT INTO bookings (user_id, room_id, full_name, purpose, start_time, end_time, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO bookings (
+                    user_id, room_id, full_name, purpose, start_time, end_time, status,
+                    recurrence_type, recurrence_until, recurrence_group
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             '''
             
             booking_id = self._execute_query(query, (
@@ -280,7 +302,10 @@ class DatabaseManager:
                 purpose,
                 start_time.isoformat(),
                 end_time.isoformat(),
-                'confirmed'
+                'confirmed',
+                recurrence_type,
+                recurrence_until.isoformat() if recurrence_until else None,
+                recurrence_group
             ))
             
             if booking_id:
