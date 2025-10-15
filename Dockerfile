@@ -23,10 +23,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Hosting expects a listening port; expose a lightweight HTTP port for health checks
+EXPOSE 8080
+
 # Default database path can be overridden by env var
 # ENV DATABASE_PATH=/app/dar_bot.db
 
 # Bot expects TELEGRAM_BOT_TOKEN in env (and optionally ADMIN_PASSWORD)
-CMD ["python", "bot.py"]
+# Start a tiny HTTP server to keep port 8080 open for platforms requiring an exposed/listening port
+CMD ["sh", "-c", "python -m http.server 8080 & exec python bot.py"]
 
 
